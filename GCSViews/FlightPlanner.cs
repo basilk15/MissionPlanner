@@ -645,6 +645,9 @@ namespace MissionPlanner.GCSViews
         /// <param name="e"></param>
         public void BUT_write_Click(object sender, EventArgs e)
         {
+            if (!ValidateDiveMission())
+                return;
+
             if ((altmode) CMB_altmode.SelectedValue == altmode.Absolute)
             {
                 if ((int) DialogResult.No ==
@@ -1894,6 +1897,9 @@ namespace MissionPlanner.GCSViews
 
         public void but_writewpfast_Click(object sender, EventArgs e)
         {
+            if (!ValidateDiveMission())
+                return;
+
             if ((altmode) CMB_altmode.SelectedValue == altmode.Absolute)
             {
                 if ((int) DialogResult.No ==
@@ -2506,6 +2512,10 @@ namespace MissionPlanner.GCSViews
                 {
                     Commands.Rows[selectedrow].Cells[Command.Index].Tag = getCmdID(((ComboBox)sender).Text);
                 }
+                if (((ComboBox) sender).Text == DiveMission.DiveCommandName)
+                {
+                    SetDiveFields(selectedrow);
+                }
                 // default takeoff to non 0 alt
                 if (((ComboBox) sender).Text == "TAKEOFF")
                 {
@@ -3106,6 +3116,16 @@ namespace MissionPlanner.GCSViews
                 temp.Tag = Commands.Rows[a].Cells[TagData.Index].Value;
 
                 temp.frame = (byte) (int) Commands.Rows[a].Cells[Frame.Index].Value;
+
+                if (command == DiveMission.DiveCommandName)
+                {
+                    // The current Lua implementation resolves a nonzero SCRIPT_TIME
+                    // location before N+1, so DIVE must never carry a stale location.
+                    temp.p1 = DiveMission.DiveScriptCommandId;
+                    temp.lat = 0;
+                    temp.lng = 0;
+                    temp.alt = 0;
+                }
 
                 return temp;
             }
@@ -3909,6 +3929,45 @@ namespace MissionPlanner.GCSViews
             }
 
             return commands;
+        }
+
+        private bool ValidateDiveMission()
+        {
+            if ((MAVLink.MAV_MISSION_TYPE) cmb_missiontype.SelectedValue != MAVLink.MAV_MISSION_TYPE.MISSION)
+                return true;
+
+            var rows = new List<DiveMissionRow>();
+            for (var index = 0; index < Commands.Rows.Count; index++)
+            {
+                var command = Convert.ToString(Commands.Rows[index].Cells[Command.Index].Value);
+                double latitude;
+                double longitude;
+                double.TryParse(Convert.ToString(Commands.Rows[index].Cells[Lat.Index].Value), out latitude);
+                double.TryParse(Convert.ToString(Commands.Rows[index].Cells[Lon.Index].Value), out longitude);
+                rows.Add(new DiveMissionRow
+                {
+                    Command = command,
+                    Latitude = latitude,
+                    Longitude = longitude
+                });
+            }
+
+            var validationError = DiveMission.Validate(rows);
+            if (validationError == null)
+                return true;
+
+            CustomMessageBox.Show(validationError +
+                                  "\n\nA dive must be defined as an adjacent DIVE -> TARGET POINT pair.",
+                "Invalid Dive Mission");
+            return false;
+        }
+
+        private void SetDiveFields(int rowIndex)
+        {
+            Commands.Rows[rowIndex].Cells[Param1.Index].Value = DiveMission.DiveScriptCommandId.ToString();
+            Commands.Rows[rowIndex].Cells[Lat.Index].Value = "0";
+            Commands.Rows[rowIndex].Cells[Lon.Index].Value = "0";
+            Commands.Rows[rowIndex].Cells[Alt.Index].Value = "0";
         }
 
         /// <summary>
@@ -5543,22 +5602,33 @@ namespace MissionPlanner.GCSViews
                 cellcmd.Value = "UNKNOWN";
                 cellcmd.Tag = temp.id;
 
-                foreach (object value in Enum.GetValues(typeof(MAVLink.MAV_CMD)))
+                ushort? previousCommand = cmdidx > 0 ? (ushort?) cmds[cmdidx - 1].id : null;
+                float? previousScriptCommandId = cmdidx > 0 ? (float?) cmds[cmdidx - 1].p1 : null;
+                var diveDisplayCommand = DiveMission.GetDisplayCommand(temp.id, temp.p1,
+                    previousCommand, previousScriptCommandId);
+                if (diveDisplayCommand != null && cellcmd.Items.Contains(diveDisplayCommand))
                 {
-                    if ((ushort) value == temp.id)
+                    cellcmd.Value = diveDisplayCommand;
+                }
+                else
+                {
+                    foreach (object value in Enum.GetValues(typeof(MAVLink.MAV_CMD)))
                     {
-                        if (Program.MONO || cellcmd.Items.Contains(value.ToString()))
-                            cellcmd.Value = value.ToString();
-                        break;
+                        if ((ushort) value == temp.id)
+                        {
+                            if (Program.MONO || cellcmd.Items.Contains(value.ToString()))
+                                cellcmd.Value = value.ToString();
+                            break;
+                        }
                     }
+                    //Check for userdefined commands
+                    try
+                    {
+                        var id = getCmd(temp.id);
+                        if (id?.Length > 0) cellcmd.Value = id;
+                    }
+                    catch { }
                 }
-                //Check for userdefined commands
-                try
-                {
-                    var id = getCmd(temp.id);
-                    if (id?.Length > 0) cellcmd.Value = id;
-                }
-                catch { }
 
 
                 // from ap_common.h
@@ -5620,8 +5690,12 @@ namespace MissionPlanner.GCSViews
                 cell = Commands.Rows[i].Cells[Param4.Index] as DataGridViewTextBoxCell;
                 cell.Value = temp.p4 * multipliers[3];
 
+                if (cellcmd.Value.ToString() == DiveMission.DiveCommandName)
+                    SetDiveFields(i);
+
                 // convert to utm/other
-                convertFromGeographic(temp.lat, temp.lng);
+                if (cellcmd.Value.ToString() != DiveMission.DiveCommandName)
+                    convertFromGeographic(temp.lat, temp.lng);
             }
 
             Commands.Enabled = true;
@@ -5730,6 +5804,8 @@ namespace MissionPlanner.GCSViews
                     if (inner.IsStartElement())
                     {
                         string cmdname = inner.Name;
+                        if (cmdname == "TARGET_POINT")
+                            cmdname = DiveMission.TargetPointCommandName;
                         string[] cmdarray = new string[7];
                         double[] cmdmultarray = new double[7] {1, 1, 1, 1, 1, 1, 1};
                         int b = 0;
@@ -5796,6 +5872,10 @@ namespace MissionPlanner.GCSViews
         //Get back MAvlink command ID based on the command name. Use this instead of Enum.Parse of MAV_CMD, because this inclues ID's of non Mavlink dictionary commands
         public ushort getCmdID(string cmdName)
         {
+            ushort diveMavCommand;
+            if (DiveMission.TryGetMavCommand(cmdName, out diveMavCommand))
+                return diveMavCommand;
+
             if (Enum.IsDefined(typeof(MAVLink.MAV_CMD),cmdName))
             {
                 return (ushort) Enum.Parse(typeof(MAVLink.MAV_CMD), cmdName, false);
@@ -6068,6 +6148,9 @@ Column 1: Field type (RALLY is the only one at the moment -- may have RALLY_LAND
         /// </summary>
         private void savewaypoints()
         {
+            if (!ValidateDiveMission())
+                return;
+
             using (SaveFileDialog fd = new SaveFileDialog())
             {
                 fd.Filter = "Mission|*.waypoints;*.txt|Mission JSON|*.mission";
@@ -6142,7 +6225,10 @@ Column 1: Field type (RALLY is the only one at the moment -- may have RALLY_LAND
                             sw.Write("\t" + ((int) Commands.Rows[a].Cells[Frame.Index].Value).ToString()); //frame
                             sw.Write("\t" + mode);
                             sw.Write("\t" +
-                                     double.Parse(Commands.Rows[a].Cells[Param1.Index].Value.ToString())
+                                     (Commands.Rows[a].Cells[Command.Index].Value.ToString() ==
+                                      DiveMission.DiveCommandName
+                                         ? DiveMission.DiveScriptCommandId
+                                         : double.Parse(Commands.Rows[a].Cells[Param1.Index].Value.ToString()))
                                          .ToString("0.00000000", new CultureInfo("en-US")));
                             sw.Write("\t" +
                                      double.Parse(Commands.Rows[a].Cells[Param2.Index].Value.ToString())

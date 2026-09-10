@@ -203,7 +203,8 @@ namespace MissionPlanner.GCSViews
             Format_SD_Card,
         }
 
-        private BindingList<string> ActionList=new BindingList<string>(Enum.GetNames(typeof(actions)).ToList());
+        private BindingList<string> ActionList = new BindingList<string>(
+            Enum.GetNames(typeof(actions)).Concat(new[] {DiveMission.DiveModeActionName}).ToList());
          
         private Dictionary<string, Action<string>> CustomActions = new Dictionary<string, Action<string>>();
 
@@ -1677,12 +1678,27 @@ namespace MissionPlanner.GCSViews
             lbl_playbackspeed.Text = "x " + LogPlayBackSpeed;
         }
 
-        private void BUTactiondo_Click(object sender, EventArgs e)
+        private async void BUTactiondo_Click(object sender, EventArgs e)
         {
+            if (CMB_action.Text == DiveMission.DiveModeActionName)
+            {
+                var actionButton = (Control) sender;
+                actionButton.Enabled = false;
+                try
+                {
+                    await ActivateDiveModeAsync().ConfigureAwait(true);
+                }
+                finally
+                {
+                    actionButton.Enabled = true;
+                }
+                return;
+            }
+
             // Custom action handling
             {
-                var customAction = CustomActions[CMB_action.Text];
-                if(customAction!=null)
+                Action<string> customAction;
+                if (CustomActions.TryGetValue(CMB_action.Text, out customAction) && customAction != null)
                 {
                     try
                     {
@@ -1877,6 +1893,171 @@ namespace MissionPlanner.GCSViews
                 }
 
                 ((Control) sender).Enabled = true;
+            }
+        }
+
+        private const int DiveAutoModeTimeoutMilliseconds = 10000;
+        private const int DiveMissionCurrentTimeoutMilliseconds = 5000;
+
+        private async Task ActivateDiveModeAsync()
+        {
+            if (MainV2.comPort.MAV.cs.firmware != Firmwares.ArduPlane)
+            {
+                CustomMessageBox.Show("Dive Mode is available only for ArduPlane.", "Dive Mode");
+                return;
+            }
+
+            if (!MainV2.comPort.BaseStream.IsOpen)
+            {
+                CustomMessageBox.Show("Connect to the aircraft before activating Dive Mode.", "Dive Mode");
+                return;
+            }
+
+            var currentMissionItem = (int) MainV2.comPort.MAV.cs.wpno;
+            var diveItem = MainV2.comPort.MAV.wps
+                .OrderBy(item => item.Key)
+                .FirstOrDefault(item => item.Key >= currentMissionItem &&
+                                        DiveMission.IsDiveMissionItem(item.Value.command, item.Value.param1));
+
+            if (!DiveMission.IsDiveMissionItem(diveItem.Value.command, diveItem.Value.param1))
+            {
+                CustomMessageBox.Show(
+                    "No upcoming DIVE item is present in the aircraft mission. Read or upload a mission containing a valid DIVE -> TARGET POINT pair first.",
+                    "Dive Mode");
+                return;
+            }
+
+            MAVLink.mavlink_mission_item_int_t targetItem;
+            if (!MainV2.comPort.MAV.wps.TryGetValue(diveItem.Key + 1, out targetItem) ||
+                targetItem.command != DiveMission.TargetPointMavCommand)
+            {
+                CustomMessageBox.Show(
+                    $"DIVE mission item {diveItem.Key} is not followed immediately by a TARGET POINT waypoint.",
+                    "Invalid Dive Mission");
+                return;
+            }
+
+            var targetLatitude = targetItem.x * 1.0e-7;
+            var targetLongitude = targetItem.y * 1.0e-7;
+            if (!DiveMission.IsValidTarget(targetLatitude, targetLongitude))
+            {
+                CustomMessageBox.Show(
+                    $"TARGET POINT mission item {diveItem.Key + 1} has an invalid latitude/longitude.",
+                    "Invalid Dive Mission");
+                return;
+            }
+
+            var confirmation =
+                $"Activate Dive Mode using mission item {diveItem.Key}?\n\n" +
+                $"Target: {targetLatitude:F7}, {targetLongitude:F7}\n\n" +
+                "Mission Planner will switch the aircraft to AUTO if needed, then select the DIVE item. " +
+                "The onboard dive implementation must already be installed and running.";
+
+            if (CustomMessageBox.Show(confirmation, "Dive Mode", MessageBoxButtons.YesNo) !=
+                (int) DialogResult.Yes)
+                return;
+
+            try
+            {
+                var sysid = MainV2.comPort.MAV.sysid;
+                var compid = MainV2.comPort.MAV.compid;
+
+                if (!await EnsureDiveAutoModeAsync(sysid, compid).ConfigureAwait(true))
+                {
+                    CustomMessageBox.Show(
+                        $"The aircraft did not report AUTO mode within {DiveAutoModeTimeoutMilliseconds / 1000} seconds. " +
+                        "The DIVE mission item was not selected.",
+                        "Dive Mode");
+                    return;
+                }
+
+                if (!await SetDiveMissionCurrentAsync(sysid, compid, (ushort) diveItem.Key).ConfigureAwait(true))
+                {
+                    CustomMessageBox.Show(
+                        $"The aircraft did not confirm DIVE mission item {diveItem.Key} as the current mission item. " +
+                        "Dive Mode activation was not confirmed.",
+                        "Dive Mode");
+                    return;
+                }
+
+                CustomMessageBox.Show(
+                    $"Dive Mode activated using mission item {diveItem.Key}.",
+                    "Dive Mode");
+            }
+            catch (Exception ex)
+            {
+                log.Error(ex);
+                CustomMessageBox.Show(Strings.CommandFailed + "\n" + ex.Message, "Dive Mode");
+            }
+        }
+
+        private async Task<bool> EnsureDiveAutoModeAsync(byte sysid, byte compid)
+        {
+            // CurrentState.mode is populated from vehicle heartbeat telemetry.
+            if (string.Equals(MainV2.comPort.MAV.cs.mode, "AUTO", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            var autoMode = new MAVLink.mavlink_set_mode_t();
+            if (!MainV2.comPort.translateMode(sysid, compid, "AUTO", ref autoMode))
+                throw new InvalidOperationException("Unable to resolve the ArduPlane AUTO mode identifier.");
+
+            var autoHeartbeat = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var subscription = MainV2.comPort.SubscribeToPacketType(MAVLink.MAVLINK_MSG_ID.HEARTBEAT, message =>
+            {
+                var heartbeat = message.ToStructure<MAVLink.mavlink_heartbeat_t>();
+                if (heartbeat.type != (byte) MAVLink.MAV_TYPE.GCS &&
+                    (heartbeat.base_mode & (byte) MAVLink.MAV_MODE_FLAG.CUSTOM_MODE_ENABLED) != 0 &&
+                    heartbeat.custom_mode == autoMode.custom_mode)
+                {
+                    autoHeartbeat.TrySetResult(true);
+                }
+
+                return true;
+            }, sysid, compid);
+
+            try
+            {
+                MainV2.comPort.setMode(sysid, compid, autoMode);
+
+                var completed = await Task.WhenAny(autoHeartbeat.Task,
+                    Task.Delay(DiveAutoModeTimeoutMilliseconds)).ConfigureAwait(true);
+                return completed == autoHeartbeat.Task && await autoHeartbeat.Task.ConfigureAwait(true);
+            }
+            finally
+            {
+                MainV2.comPort.UnSubscribeToPacketType(subscription);
+            }
+        }
+
+        private async Task<bool> SetDiveMissionCurrentAsync(byte sysid, byte compid, ushort diveSequence)
+        {
+            var matchingMissionCurrent =
+                new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var subscription = MainV2.comPort.SubscribeToPacketType(MAVLink.MAVLINK_MSG_ID.MISSION_CURRENT, message =>
+            {
+                var missionCurrent = message.ToStructure<MAVLink.mavlink_mission_current_t>();
+                if (missionCurrent.seq == diveSequence)
+                    matchingMissionCurrent.TrySetResult(true);
+
+                return true;
+            }, sysid, compid);
+
+            try
+            {
+                var accepted = await MainV2.comPort.doCommandIntAsync(sysid, compid,
+                    MAVLink.MAV_CMD.DO_SET_MISSION_CURRENT,
+                    diveSequence, 0, 0, 0, 0, 0, 0, true, null, MAVLink.MAV_FRAME.MISSION).ConfigureAwait(true);
+                if (!accepted)
+                    return false;
+
+                var completed = await Task.WhenAny(matchingMissionCurrent.Task,
+                    Task.Delay(DiveMissionCurrentTimeoutMilliseconds)).ConfigureAwait(true);
+                return completed == matchingMissionCurrent.Task &&
+                       await matchingMissionCurrent.Task.ConfigureAwait(true);
+            }
+            finally
+            {
+                MainV2.comPort.UnSubscribeToPacketType(subscription);
             }
         }
 
