@@ -73,6 +73,48 @@ namespace MissionPlannerTests.Utilities
         }
 
         [TestMethod]
+        public void RawPairSelectionReturnsTheImmediateTargetSequence()
+        {
+            var rows = new List<DiveMissionRow>
+            {
+                RawRow(MAVLink.MAV_CMD.WAYPOINT, 0, 1, 1),
+                RawRow(MAVLink.MAV_CMD.SCRIPT_TIME, 200),
+                RawRow(MAVLink.MAV_CMD.WAYPOINT, 0, 10, 20),
+                RawRow(MAVLink.MAV_CMD.WAYPOINT, 0, 30, 40)
+            };
+            rows[0].Sequence = 2;
+            rows[1].Sequence = 4;
+            rows[2].Sequence = 5;
+            rows[3].Sequence = 6;
+
+            DiveMission.DiveTargetPair pair;
+            string error;
+            Assert.IsTrue(DiveMission.TryFindNextDiveTargetPair(rows, 4, out pair, out error));
+            Assert.IsNull(error);
+            Assert.AreEqual(4, pair.DiveSequence);
+            Assert.AreEqual(5, pair.TargetSequence);
+            Assert.AreEqual(10, pair.TargetLatitude);
+            Assert.AreEqual(20, pair.TargetLongitude);
+        }
+
+        [TestMethod]
+        public void RawPairSelectionRejectsASequenceGap()
+        {
+            var rows = new List<DiveMissionRow>
+            {
+                RawRow(MAVLink.MAV_CMD.SCRIPT_TIME, 200),
+                RawRow(MAVLink.MAV_CMD.WAYPOINT, 0, 10, 20)
+            };
+            rows[0].Sequence = 4;
+            rows[1].Sequence = 6;
+
+            DiveMission.DiveTargetPair pair;
+            string error;
+            Assert.IsFalse(DiveMission.TryFindNextDiveTargetPair(rows, 0, out pair, out error));
+            StringAssert.Contains(error, "not followed immediately");
+        }
+
+        [TestMethod]
         public void GenericRawScriptTimeDoesNotCreateTargetPair()
         {
             var rows = new List<DiveMissionRow>
@@ -127,6 +169,29 @@ namespace MissionPlannerTests.Utilities
                 Row(DiveMission.TargetPointCommandName, 0, 0)
             });
             StringAssert.Contains(unsetError, "invalid latitude/longitude");
+        }
+
+        [TestMethod]
+        public void ActivationDecisionAcceptsAnAlreadyReportedDiveMode()
+        {
+            Assert.AreEqual(DiveMission.ActivationStep.Activated,
+                DiveMission.GetActivationStep(true, true, true));
+        }
+
+        [TestMethod]
+        public void ActivationDecisionRequestsModeAfterMissionSelection()
+        {
+            Assert.AreEqual(DiveMission.ActivationStep.RequestDiveMode,
+                DiveMission.GetActivationStep(true, true, false));
+        }
+
+        [TestMethod]
+        public void ActivationDecisionDistinguishesMissionSelectionFailures()
+        {
+            Assert.AreEqual(DiveMission.ActivationStep.MissionCurrentRejected,
+                DiveMission.GetActivationStep(false, false, false));
+            Assert.AreEqual(DiveMission.ActivationStep.MissionCurrentConfirmationTimedOut,
+                DiveMission.GetActivationStep(true, false, false));
         }
 
         private static DiveMissionRow Row(string command, double latitude = 0, double longitude = 0)

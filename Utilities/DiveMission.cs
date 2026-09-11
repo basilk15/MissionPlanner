@@ -13,12 +13,30 @@ namespace MissionPlanner.Utilities
         public const string DiveCommandName = "DIVE";
         public const string TargetPointCommandName = "TARGET POINT";
         public const string DiveModeActionName = "Dive Mode";
+        public const string DiveModeName = MissionPlanner.ArduPilot.Common.DiveModeName;
+        public const uint DiveModeCustomMode = (uint) MissionPlanner.ArduPilot.Common.DiveModeCustomMode;
         // MAV_CMD_NAV_SCRIPT_TIME.param1 is an application-defined command ID (0..255).
         // 200 is reserved by this custom aircraft integration for the dive script.
         public const ushort DiveScriptCommandId = 200;
 
         public static readonly ushort DiveMavCommand = (ushort) MAVLink.MAV_CMD.SCRIPT_TIME;
         public static readonly ushort TargetPointMavCommand = (ushort) MAVLink.MAV_CMD.WAYPOINT;
+
+        public enum ActivationStep
+        {
+            MissionCurrentRejected,
+            MissionCurrentConfirmationTimedOut,
+            RequestDiveMode,
+            Activated
+        }
+
+        public sealed class DiveTargetPair
+        {
+            public int DiveSequence { get; set; }
+            public int TargetSequence { get; set; }
+            public double TargetLatitude { get; set; }
+            public double TargetLongitude { get; set; }
+        }
 
         public static bool TryGetMavCommand(string displayCommand, out ushort mavCommand)
         {
@@ -90,6 +108,71 @@ namespace MissionPlanner.Utilities
             return null;
         }
 
+        /// <summary>
+        /// Finds the first raw DIVE item at or after minimumSequence and validates its
+        /// immediate raw waypoint target.  The sequence adjacency check is kept here
+        /// because a mission dictionary can have gaps even when its rows are ordered.
+        /// </summary>
+        public static bool TryFindNextDiveTargetPair(IList<DiveMissionRow> rows, int minimumSequence,
+            out DiveTargetPair pair, out string validationError)
+        {
+            pair = null;
+            validationError = null;
+
+            var diveIndex = -1;
+            for (var index = 0; index < rows.Count; index++)
+            {
+                if (rows[index].Sequence >= minimumSequence && IsDiveRow(rows[index]))
+                {
+                    diveIndex = index;
+                    break;
+                }
+            }
+
+            if (diveIndex < 0)
+            {
+                validationError =
+                    "No upcoming DIVE item is present in the aircraft mission. Read or upload a mission containing a valid DIVE -> TARGET POINT pair first.";
+                return false;
+            }
+
+            var diveRow = rows[diveIndex];
+            if (diveIndex + 1 >= rows.Count ||
+                rows[diveIndex + 1].Sequence != diveRow.Sequence + 1 ||
+                !IsTargetPointRow(rows, diveIndex + 1))
+            {
+                validationError =
+                    $"DIVE mission item {diveRow.Sequence} is not followed immediately by a TARGET POINT waypoint.";
+                return false;
+            }
+
+            var targetRow = rows[diveIndex + 1];
+            validationError = Validate(new List<DiveMissionRow> {diveRow, targetRow});
+            if (validationError != null)
+                return false;
+
+            pair = new DiveTargetPair
+            {
+                DiveSequence = diveRow.Sequence,
+                TargetSequence = targetRow.Sequence,
+                TargetLatitude = targetRow.Latitude,
+                TargetLongitude = targetRow.Longitude
+            };
+            return true;
+        }
+
+        public static ActivationStep GetActivationStep(bool missionCurrentAccepted,
+            bool missionCurrentConfirmed, bool diveModeHeartbeatObserved)
+        {
+            if (!missionCurrentAccepted)
+                return ActivationStep.MissionCurrentRejected;
+
+            if (!missionCurrentConfirmed)
+                return ActivationStep.MissionCurrentConfirmationTimedOut;
+
+            return diveModeHeartbeatObserved ? ActivationStep.Activated : ActivationStep.RequestDiveMode;
+        }
+
         private static bool IsDiveRow(DiveMissionRow row)
         {
             return string.Equals(row.Command, DiveCommandName, StringComparison.Ordinal) ||
@@ -121,6 +204,7 @@ namespace MissionPlanner.Utilities
 
     public sealed class DiveMissionRow
     {
+        public int Sequence { get; set; }
         public string Command { get; set; }
         public ushort MavCommand { get; set; }
         public float Param1 { get; set; }

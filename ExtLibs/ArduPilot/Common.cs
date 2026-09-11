@@ -85,6 +85,10 @@ namespace MissionPlanner.ArduPilot
             };
 
         private static readonly ILog log = LogManager.GetLogger(MethodBase.GetCurrentMethod().DeclaringType);
+
+        public const int DiveModeCustomMode = 27;
+        public const string DiveModeName = "DIVE";
+
         public static List<KeyValuePair<int, string>> getModesList(Firmwares firmware)
         {
             //log.Info("getModesList Called");
@@ -144,6 +148,19 @@ union px4_custom_mode {
             {
                 var flightModes = Utilities.ParameterMetaDataRepository.GetParameterOptionsInt("FLTMODE1",
                     firmware.ToString());
+
+                // Custom Plane builds can advertise additional modes through their
+                // parameter metadata.  Keep the shared metadata list authoritative,
+                // but retain the frozen DIVE contract when a cached stock pdef omits it.
+                var diveModeIndex = flightModes.FindIndex(mode =>
+                    mode.Key == DiveModeCustomMode);
+                if (diveModeIndex < 0)
+                    flightModes.Add(new KeyValuePair<int, string>(DiveModeCustomMode, DiveModeName));
+                else if (!string.Equals(flightModes[diveModeIndex].Value, DiveModeName,
+                             StringComparison.OrdinalIgnoreCase))
+                    flightModes[diveModeIndex] = new KeyValuePair<int, string>(
+                        DiveModeCustomMode, DiveModeName);
+
                 flightModes.Add(new KeyValuePair<int, string>(16, "INITIALISING"));
 
                 return flightModes;
