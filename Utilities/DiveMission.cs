@@ -63,20 +63,19 @@ namespace MissionPlanner.Utilities
             {
                 var row = rows[index];
 
-                if (string.Equals(row.Command, DiveCommandName, StringComparison.Ordinal))
+                if (IsDiveRow(row))
                 {
                     if (index + 1 >= rows.Count ||
-                        !string.Equals(rows[index + 1].Command, TargetPointCommandName,
-                            StringComparison.Ordinal))
+                        !IsTargetPointRow(rows, index + 1))
                     {
                         return $"DIVE at mission row {index + 1} must be followed immediately by TARGET POINT.";
                     }
                 }
 
-                if (string.Equals(row.Command, TargetPointCommandName, StringComparison.Ordinal))
+                if (IsTargetPointRow(rows, index))
                 {
                     if (index == 0 ||
-                        !string.Equals(rows[index - 1].Command, DiveCommandName, StringComparison.Ordinal))
+                        !IsDiveRow(rows[index - 1]))
                     {
                         return $"TARGET POINT at mission row {index + 1} must immediately follow DIVE.";
                     }
@@ -89,6 +88,25 @@ namespace MissionPlanner.Utilities
             }
 
             return null;
+        }
+
+        private static bool IsDiveRow(DiveMissionRow row)
+        {
+            return string.Equals(row.Command, DiveCommandName, StringComparison.Ordinal) ||
+                   IsDiveMissionItem(row.MavCommand, row.Param1);
+        }
+
+        private static bool IsTargetPointRow(IList<DiveMissionRow> rows, int index)
+        {
+            var row = rows[index];
+            if (string.Equals(row.Command, TargetPointCommandName, StringComparison.Ordinal))
+                return true;
+
+            // On the MAVLink wire TARGET POINT is deliberately an ordinary waypoint.
+            // Its position immediately after SCRIPT_TIME command ID 200 defines it as
+            // the target, even when a UI/runtime displays the raw command names.
+            return row.MavCommand == TargetPointMavCommand &&
+                   index > 0 && IsDiveRow(rows[index - 1]);
         }
 
         public static bool IsValidTarget(double latitude, double longitude)
@@ -104,6 +122,8 @@ namespace MissionPlanner.Utilities
     public sealed class DiveMissionRow
     {
         public string Command { get; set; }
+        public ushort MavCommand { get; set; }
+        public float Param1 { get; set; }
         public double Latitude { get; set; }
         public double Longitude { get; set; }
     }

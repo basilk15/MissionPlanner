@@ -3942,11 +3942,30 @@ namespace MissionPlanner.GCSViews
                 var command = Convert.ToString(Commands.Rows[index].Cells[Command.Index].Value);
                 double latitude;
                 double longitude;
+                float param1;
+                ushort mavCommand;
                 double.TryParse(Convert.ToString(Commands.Rows[index].Cells[Lat.Index].Value), out latitude);
                 double.TryParse(Convert.ToString(Commands.Rows[index].Cells[Lon.Index].Value), out longitude);
+                float.TryParse(Convert.ToString(Commands.Rows[index].Cells[Param1.Index].Value), out param1);
+
+                var commandTag = Commands.Rows[index].Cells[Command.Index].Tag;
+                if (commandTag == null || !ushort.TryParse(Convert.ToString(commandTag), out mavCommand))
+                {
+                    try
+                    {
+                        mavCommand = getCmdID(command);
+                    }
+                    catch
+                    {
+                        mavCommand = 0;
+                    }
+                }
+
                 rows.Add(new DiveMissionRow
                 {
                     Command = command,
+                    MavCommand = mavCommand,
+                    Param1 = param1,
                     Latitude = latitude,
                     Longitude = longitude
                 });
@@ -5606,7 +5625,10 @@ namespace MissionPlanner.GCSViews
                 float? previousScriptCommandId = cmdidx > 0 ? (float?) cmds[cmdidx - 1].p1 : null;
                 var diveDisplayCommand = DiveMission.GetDisplayCommand(temp.id, temp.p1,
                     previousCommand, previousScriptCommandId);
-                if (diveDisplayCommand != null && cellcmd.Items.Contains(diveDisplayCommand))
+                // Mono does not reliably expose a DataGridViewComboBoxColumn's bound
+                // DataSource through an individual cell's Items collection. The
+                // command metadata is the authoritative source for allowed values.
+                if (diveDisplayCommand != null && cmdParamNames.ContainsKey(diveDisplayCommand))
                 {
                     cellcmd.Value = diveDisplayCommand;
                 }
