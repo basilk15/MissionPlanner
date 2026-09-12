@@ -1962,6 +1962,39 @@ namespace MissionPlanner.GCSViews
                 var sysid = MainV2.comPort.MAV.sysid;
                 var compid = MainV2.comPort.MAV.compid;
 
+                var missionCurrentResult = await SetDiveMissionCurrentAsync(sysid, compid,
+                    (ushort) divePair.DiveSequence).ConfigureAwait(true);
+
+                if (missionCurrentResult == DiveMissionCurrentResult.Rejected)
+                {
+                    CustomMessageBox.Show(
+                        $"The aircraft rejected selection of DIVE mission item {divePair.DiveSequence}. " +
+                        "Dive Mode activation was not confirmed.",
+                        "Dive Mode");
+                    return;
+                }
+
+                if (missionCurrentResult == DiveMissionCurrentResult.CommandTimedOut)
+                {
+                    CustomMessageBox.Show(
+                        "The aircraft did not acknowledge the DIVE mission-item selection command. " +
+                        "Dive Mode activation was not confirmed.",
+                        "Dive Mode");
+                    return;
+                }
+
+                if (missionCurrentResult == DiveMissionCurrentResult.ConfirmationTimedOut)
+                {
+                    CustomMessageBox.Show(
+                        $"The aircraft did not confirm MISSION_CURRENT.seq={divePair.DiveSequence}. " +
+                        "Dive Mode activation was not confirmed.",
+                        "Dive Mode");
+                    return;
+                }
+
+                // Subscribe only after mission-current confirmation.  Thus no
+                // cached mode string, or heartbeat emitted before this
+                // selection, can satisfy the activation confirmation.
                 var diveHeartbeat = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
                 var heartbeatSubscription = MainV2.comPort.SubscribeToPacketType(MAVLink.MAVLINK_MSG_ID.HEARTBEAT,
                     message =>
@@ -1977,43 +2010,10 @@ namespace MissionPlanner.GCSViews
 
                 try
                 {
-                    // The mapped mode string is useful as an immediate cached indication;
-                    // the heartbeat subscription above remains authoritative for raw mode 27.
-                    if (string.Equals(MainV2.comPort.MAV.cs.mode, DiveMission.DiveModeName,
-                            StringComparison.OrdinalIgnoreCase))
-                        diveHeartbeat.TrySetResult(true);
-
-                    var missionCurrentResult = await SetDiveMissionCurrentAsync(sysid, compid,
-                        (ushort) divePair.DiveSequence).ConfigureAwait(true);
-
-                    if (missionCurrentResult == DiveMissionCurrentResult.Rejected)
-                    {
-                        CustomMessageBox.Show(
-                            $"The aircraft rejected selection of DIVE mission item {divePair.DiveSequence}. " +
-                            "Dive Mode activation was not confirmed.",
-                            "Dive Mode");
-                        return;
-                    }
-
-                    if (missionCurrentResult == DiveMissionCurrentResult.CommandTimedOut)
-                    {
-                        CustomMessageBox.Show(
-                            "The aircraft did not acknowledge the DIVE mission-item selection command. " +
-                            "Dive Mode activation was not confirmed.",
-                            "Dive Mode");
-                        return;
-                    }
-
-                    if (missionCurrentResult == DiveMissionCurrentResult.ConfirmationTimedOut)
-                    {
-                        CustomMessageBox.Show(
-                            $"The aircraft did not confirm MISSION_CURRENT.seq={divePair.DiveSequence}. " +
-                            "Dive Mode activation was not confirmed.",
-                            "Dive Mode");
-                        return;
-                    }
-
-                    var activationStep = DiveMission.GetActivationStep(true, true, diveHeartbeat.Task.IsCompleted);
+                    // A new mode request is intentional even if the cached
+                    // vehicle state already says DIVE; only a future heartbeat
+                    // after mission selection confirms this activation.
+                    var activationStep = DiveMission.GetActivationStep(true, true, false);
                     if (activationStep != DiveMission.ActivationStep.Activated)
                     {
                         var diveMode = new MAVLink.mavlink_set_mode_t();
